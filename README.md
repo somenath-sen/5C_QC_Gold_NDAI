@@ -28,5 +28,3 @@ Each file is organized as follows:
 ## Notes
 - All queries are written for MySQL (AWS VPN required)
 - Fill rates reference staging.fill_rate_report_gold where available
-- radiology img_date and result_date are VARCHAR(100) — STR_TO_DATE() or LEFT() casting required
-- StarRocks compatible versions: replace COUNT(*) with COUNT(1) and remove SELECT *
