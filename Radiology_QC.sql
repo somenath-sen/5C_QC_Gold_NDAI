@@ -1,233 +1,301 @@
 -- =============================================================================
--- NeuroDiscovery AI — Gold Layer QC Queries
--- Table: rgd_gold_ad.radiology
--- Schema: rgd_gold_ad
--- Prepared By: Somenath Sen — RWD Team
--- Date: July 2026
+-- NeuroDiscovery AI - Regulatory-Grade Data QC Queries (5C Model)
+-- Table: rgd_gold_ad.radiology  (Gold Layer)
+-- Prepared By: Somenath Sen - RWD Team
+-- Date: August 2026
 -- Framework: 5C (Completeness, Correctness, Concordance, Credibility, Currency)
--- DE Key: psid + ndid + eid + result_id + img_finding + report_id
---         + report_date + img_date + study_name
--- Gold mapping: eid → encounterid, result_id → resultid, report_date → result_date
--- Missing DE fields: report_id (not in Gold)
--- Note: img_date and result_date are VARCHAR(100) — use LEFT(col,10) or STR_TO_DATE()
--- Exclusions: records where resultid + study_name both null (shell records)
---             case-insensitive LOWER(study_name)
+-- IMPORTANT: img_date and result_date are VARCHAR(100) storing datetime strings
+--            ('YYYY-MM-DD 00:00:00'). Use STR_TO_DATE(LEFT(col,10),'%Y-%m-%d') for
+--            all date logic. VERIFIED: all populated values parse with this pattern.
+--            enc_date is DATETIME; img_order_date is DATE (native, no cast needed).
+-- Snapshot: cohort_run_id = 19, run 2026-07-30 (single load, 1:1 source mapping).
 -- =============================================================================
 
--- ─────────────────────────────────────────────────────────────────────────────
--- BASELINE
--- ─────────────────────────────────────────────────────────────────────────────
 
--- B1. Total records, patients, psids
+-- #############################################################################
+-- # BASELINE
+-- #############################################################################
+
+===========BASELINE: total records, patients, psids=======
 SELECT COUNT(*) AS total_records,
-    COUNT(DISTINCT ndid) AS unique_patients,
-    COUNT(DISTINCT psid) AS unique_psids
+       COUNT(DISTINCT ndid) AS unique_patients,
+       COUNT(DISTINCT psid) AS unique_psids
 FROM rgd_gold_ad.radiology;
 
--- B2. Records and patients by psid
-SELECT psid, COUNT(*) AS records,
-    COUNT(DISTINCT ndid) AS unique_patients
+===========BASELINE: records by psid=======
+SELECT psid, COUNT(*) AS records, COUNT(DISTINCT ndid) AS patients,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
 FROM rgd_gold_ad.radiology
-GROUP BY psid ORDER BY records DESC;
-
--- B3. Cohort coverage
-SELECT
-    (SELECT COUNT(DISTINCT ndid) FROM rgd_gold_ad.patients) AS cohort_patients,
-    COUNT(DISTINCT ndid) AS patients_with_radiology,
-    (SELECT COUNT(DISTINCT ndid) FROM rgd_gold_ad.patients)
-        - COUNT(DISTINCT ndid) AS patients_without_radiology
-FROM rgd_gold_ad.radiology;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- 1. COMPLETENESS
--- ─────────────────────────────────────────────────────────────────────────────
-
--- C1.1 Null counts across all columns
-SELECT
-    SUM(CASE WHEN ndid IS NULL THEN 1 ELSE 0 END) AS null_ndid,
-    SUM(CASE WHEN encounterid IS NULL THEN 1 ELSE 0 END) AS null_encounterid,
-    SUM(CASE WHEN enc_date IS NULL THEN 1 ELSE 0 END) AS null_enc_date,
-    SUM(CASE WHEN resultid IS NULL THEN 1 ELSE 0 END) AS null_resultid,
-    SUM(CASE WHEN img_date IS NULL OR img_date = '' THEN 1 ELSE 0 END) AS null_img_date,
-    SUM(CASE WHEN result_date IS NULL OR result_date = '' THEN 1 ELSE 0 END) AS null_result_date,
-    SUM(CASE WHEN study_name IS NULL OR study_name = '' THEN 1 ELSE 0 END) AS null_study_name,
-    SUM(CASE WHEN img_modality IS NULL OR img_modality = '' THEN 1 ELSE 0 END) AS null_img_modality,
-    SUM(CASE WHEN img_report_status IS NULL OR img_report_status = '' THEN 1 ELSE 0 END) AS null_img_report_status,
-    SUM(CASE WHEN img_report_text IS NULL OR img_report_text = '' THEN 1 ELSE 0 END) AS null_img_report_text,
-    SUM(CASE WHEN img_finding IS NULL OR img_finding = '' THEN 1 ELSE 0 END) AS null_img_finding,
-    SUM(CASE WHEN img_order_date IS NULL OR img_order_date = '' THEN 1 ELSE 0 END) AS null_img_order_date
-FROM rgd_gold_ad.radiology;
-
--- C1.2 Fill rate from DE table (official source)
-SELECT column_name, total_count, null_records, fill_rate_pct
-FROM staging.fill_rate_report_gold
-WHERE schema_name = 'rgd_gold_ad'
-AND table_name = 'radiology'
-ORDER BY fill_rate_pct DESC;
-
--- C1.3 Shell records (null resultid + null img_date + null result_date) by psid
-SELECT psid,
-    SUM(CASE WHEN resultid IS NULL AND img_date IS NULL
-             AND result_date IS NULL THEN 1 ELSE 0 END) AS shell_records,
-    COUNT(*) AS total_records,
-    ROUND(SUM(CASE WHEN resultid IS NULL AND img_date IS NULL
-             AND result_date IS NULL THEN 1 ELSE 0 END)/COUNT(*)*100,2) AS pct_shell
-FROM rgd_gold_ad.radiology
-GROUP BY psid ORDER BY shell_records DESC;
-
--- C1.4 Encounterid null by psid
-SELECT psid,
-    SUM(CASE WHEN encounterid IS NULL THEN 1 ELSE 0 END) AS null_encounterid,
-    COUNT(*) AS total_records,
-    ROUND(SUM(CASE WHEN encounterid IS NULL THEN 1 ELSE 0 END)/COUNT(*)*100,2) AS pct_null
-FROM rgd_gold_ad.radiology
-GROUP BY psid ORDER BY null_encounterid DESC;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- 2. CORRECTNESS
--- ─────────────────────────────────────────────────────────────────────────────
-
--- C2.1 Date plausibility (img_date is VARCHAR — requires casting)
-SELECT
-    SUM(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') > '2900-01-01'
-             THEN 1 ELSE 0 END) AS far_future,
-    SUM(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') > CURDATE()
-             AND STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') <= '2900-01-01'
-             THEN 1 ELSE 0 END) AS near_future,
-    SUM(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') < '1900-01-01'
-             THEN 1 ELSE 0 END) AS before_1900,
-    SUM(CASE WHEN LEFT(img_date,4) = '0000' THEN 1 ELSE 0 END) AS zero_year
-FROM rgd_gold_ad.radiology
-WHERE img_date IS NOT NULL AND img_date != '';
-
--- C2.2 Date plausibility by psid
-SELECT psid,
-    SUM(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') > CURDATE()
-             THEN 1 ELSE 0 END) AS future_img_date,
-    SUM(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') < '1900-01-01'
-             THEN 1 ELSE 0 END) AS before_1900
-FROM rgd_gold_ad.radiology
-WHERE img_date IS NOT NULL AND img_date != ''
 GROUP BY psid
-HAVING future_img_date > 0 OR before_1900 > 0
-ORDER BY future_img_date DESC;
+ORDER BY records DESC;
 
--- C2.3 Non-radiology study_name content
-SELECT study_name, COUNT(*) AS cnt
-FROM rgd_gold_ad.radiology
-WHERE LOWER(study_name) IN (
-    'vitamin b12','tsh','thyroid stimulating hormone',
-    'comprehensive metabolic panel','comp. metabolic panel',
-    'electroencephalogram','electrolyte panel',
-    'valproic acid level','phenobarbital'
+===========BASELINE: cohort coverage=======
+SELECT
+    COUNT(DISTINCT p.ndid) AS total_cohort_patients,
+    COUNT(DISTINCT r.ndid) AS patients_with_radiology,
+    COUNT(DISTINCT p.ndid) - COUNT(DISTINCT r.ndid) AS patients_without_radiology
+FROM rgd_gold_ad.patients p
+LEFT JOIN rgd_gold_ad.radiology r ON p.ndid = r.ndid;
+
+
+-- #############################################################################
+-- # 1. COMPLETENESS
+-- #############################################################################
+
+===========COMPLETENESS: rgd_gold_ad.radiology - full column fill rate=======
+WITH cohort_rad AS (
+    SELECT * FROM rgd_gold_ad.radiology WHERE udm_active_flag = 'Y'
 )
-GROUP BY study_name ORDER BY cnt DESC;
+SELECT 'ndid' AS column_name, COUNT(*) AS denominator, ROUND(SUM(CASE WHEN ndid IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pct_present FROM cohort_rad
+UNION ALL
+SELECT 'encounterid', COUNT(*), ROUND(SUM(CASE WHEN encounterid IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'resultid', COUNT(*), ROUND(SUM(CASE WHEN resultid IS NOT NULL AND TRIM(resultid) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'enc_date', COUNT(*), ROUND(SUM(CASE WHEN enc_date IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_order_date', COUNT(*), ROUND(SUM(CASE WHEN img_order_date IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_date', COUNT(*), ROUND(SUM(CASE WHEN img_date IS NOT NULL AND TRIM(img_date) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'result_date', COUNT(*), ROUND(SUM(CASE WHEN result_date IS NOT NULL AND TRIM(result_date) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'study_name', COUNT(*), ROUND(SUM(CASE WHEN study_name IS NOT NULL AND TRIM(study_name) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_modality', COUNT(*), ROUND(SUM(CASE WHEN img_modality IS NOT NULL AND TRIM(img_modality) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_body_part', COUNT(*), ROUND(SUM(CASE WHEN img_body_part IS NOT NULL AND TRIM(img_body_part) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_contrast_type', COUNT(*), ROUND(SUM(CASE WHEN img_contrast_type IS NOT NULL AND TRIM(img_contrast_type) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_tracer_name', COUNT(*), ROUND(SUM(CASE WHEN img_tracer_name IS NOT NULL AND TRIM(img_tracer_name) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'cpt_code', COUNT(*), ROUND(SUM(CASE WHEN cpt_code IS NOT NULL AND TRIM(cpt_code) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'cpt_code_source', COUNT(*), ROUND(SUM(CASE WHEN cpt_code_source IS NOT NULL AND TRIM(cpt_code_source) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_report_status', COUNT(*), ROUND(SUM(CASE WHEN img_report_status IS NOT NULL AND TRIM(img_report_status) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_report_text', COUNT(*), ROUND(SUM(CASE WHEN img_report_text IS NOT NULL AND TRIM(img_report_text) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad
+UNION ALL
+SELECT 'img_finding', COUNT(*), ROUND(SUM(CASE WHEN img_finding IS NOT NULL AND TRIM(img_finding) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM cohort_rad;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 3. CONCORDANCE
--- ─────────────────────────────────────────────────────────────────────────────
+===========COMP-001: ndid completeness (Critical, threshold 0% missing)=======
+SELECT COUNT(*) AS total_rows,
+       SUM(CASE WHEN ndid IS NULL THEN 1 ELSE 0 END) AS n_missing_ndid,
+       ROUND(SUM(CASE WHEN ndid IS NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pct_missing_ndid
+FROM rgd_gold_ad.radiology;
 
--- C3.1 img_report_status distribution
-SELECT img_report_status, COUNT(*) AS cnt
+===========COMP-002: encounterid completeness (Critical, threshold 0% missing)=======
+SELECT COUNT(*) AS total_rows,
+       SUM(CASE WHEN encounterid IS NULL THEN 1 ELSE 0 END) AS n_missing_encounterid,
+       ROUND(SUM(CASE WHEN encounterid IS NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pct_missing_encounterid
+FROM rgd_gold_ad.radiology;
+
+===========COMP-002b: encounterid null by psid (source-structural pattern)=======
+SELECT psid,
+       SUM(CASE WHEN encounterid IS NULL THEN 1 ELSE 0 END) AS n_missing,
+       COUNT(*) AS total,
+       ROUND(SUM(CASE WHEN encounterid IS NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pct_missing
 FROM rgd_gold_ad.radiology
-GROUP BY img_report_status ORDER BY cnt DESC;
+GROUP BY psid
+ORDER BY n_missing DESC;
 
--- C3.2 img_modality distribution
-SELECT img_modality, COUNT(*) AS cnt
+===========COMP-003: img_date completeness (Major, threshold >=95%) - VARCHAR, use populated check=======
+SELECT COUNT(*) AS total_rows,
+       SUM(CASE WHEN img_date IS NULL OR TRIM(img_date) = '' THEN 1 ELSE 0 END) AS n_missing_img_date,
+       ROUND(SUM(CASE WHEN img_date IS NOT NULL AND TRIM(img_date) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pct_present
+FROM rgd_gold_ad.radiology;
+
+===========COMP-005: study_name completeness (Major, threshold >=95%)=======
+SELECT COUNT(*) AS total_rows,
+       ROUND(SUM(CASE WHEN study_name IS NOT NULL AND TRIM(study_name) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pct_present_study_name
+FROM rgd_gold_ad.radiology;
+
+===========COMP-017: sparse / near-empty columns (Major) - img_order_date, img_tracer_name=======
+-- VERIFIED: img_order_date 3.25% populated; img_tracer_name 0.28% populated (expected -
+-- only PET/nuclear studies carry a tracer). Documented as structural, not corrective.
+SELECT 'img_order_date' AS column_name, ROUND(SUM(CASE WHEN img_order_date IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pct_present FROM rgd_gold_ad.radiology
+UNION ALL
+SELECT 'img_tracer_name', ROUND(SUM(CASE WHEN img_tracer_name IS NOT NULL AND TRIM(img_tracer_name) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM rgd_gold_ad.radiology
+UNION ALL
+SELECT 'img_finding', ROUND(SUM(CASE WHEN img_finding IS NOT NULL AND TRIM(img_finding) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM rgd_gold_ad.radiology
+UNION ALL
+SELECT 'img_report_status', ROUND(SUM(CASE WHEN img_report_status IS NOT NULL AND TRIM(img_report_status) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM rgd_gold_ad.radiology
+UNION ALL
+SELECT 'img_report_text', ROUND(SUM(CASE WHEN img_report_text IS NOT NULL AND TRIM(img_report_text) != '' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) FROM rgd_gold_ad.radiology;
+
+===========COMP-020: udm_unq_id completeness (Critical, threshold 0% missing)=======
+SELECT COUNT(*) AS total_rows,
+       SUM(CASE WHEN udm_unq_id IS NULL OR TRIM(udm_unq_id) = '' THEN 1 ELSE 0 END) AS n_missing_udm_unq_id
+FROM rgd_gold_ad.radiology;
+
+
+-- #############################################################################
+-- # 2. CORRECTNESS
+-- #############################################################################
+
+===========CORR-006: date-type conformance (img_date / result_date are VARCHAR)=======
+-- VERIFIED: all populated img_date/result_date values parse via STR_TO_DATE(LEFT(col,10),'%Y-%m-%d').
+-- Stored as 'YYYY-MM-DD 00:00:00' text. Casting mandatory for all date logic.
+SELECT
+    SUM(CASE WHEN img_date IS NOT NULL AND TRIM(img_date) != '' THEN 1 ELSE 0 END) AS img_date_populated,
+    SUM(CASE WHEN STR_TO_DATE(LEFT(img_date,10), '%Y-%m-%d') IS NOT NULL THEN 1 ELSE 0 END) AS img_date_parses,
+    SUM(CASE WHEN result_date IS NOT NULL AND TRIM(result_date) != '' THEN 1 ELSE 0 END) AS result_date_populated,
+    SUM(CASE WHEN STR_TO_DATE(LEFT(result_date,10), '%Y-%m-%d') IS NOT NULL THEN 1 ELSE 0 END) AS result_date_parses
+FROM rgd_gold_ad.radiology;
+
+===========CORR-011a: img_date plausibility classification (cast VARCHAR)=======
+SELECT
+    CASE
+        WHEN img_date IS NULL OR TRIM(img_date) = '' THEN 'NULL/EMPTY'
+        WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') > CURDATE() THEN 'FUTURE_DATE'
+        WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') < '1900-01-01' THEN 'TOO_OLD (<1900)'
+        ELSE 'PLAUSIBLE'
+    END AS img_date_category,
+    COUNT(*) AS n_rows,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
 FROM rgd_gold_ad.radiology
-WHERE img_modality IS NOT NULL AND img_modality != ''
-GROUP BY img_modality ORDER BY cnt DESC LIMIT 20;
+GROUP BY img_date_category
+ORDER BY n_rows DESC;
 
--- C3.3 Top study names
-SELECT study_name, COUNT(*) AS cnt
+===========CORR-011b: implausible img_date detail (future + ancient)=======
+SELECT ndid, psid, encounterid, img_date, study_name, img_modality
 FROM rgd_gold_ad.radiology
-WHERE study_name IS NOT NULL AND study_name != ''
-GROUP BY study_name ORDER BY cnt DESC LIMIT 20;
+WHERE STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') > CURDATE()
+   OR STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') < '1900-01-01'
+ORDER BY STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') DESC
+LIMIT 100;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 4. CREDIBILITY
--- ─────────────────────────────────────────────────────────────────────────────
+===========CORR-011c: valid img_date range=======
+SELECT
+    MIN(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') >= '1900-01-01' THEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') END) AS min_valid_img_date,
+    MAX(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') <= CURDATE() THEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') END) AS max_valid_img_date
+FROM rgd_gold_ad.radiology;
 
--- C4.1 Duplicate count on clean DE key
-SELECT COUNT(*) AS duplicate_groups, SUM(grp_size-1) AS excess_rows
+===========CORR-012: primary key uniqueness (udm_unq_id)=======
+SELECT COUNT(*) AS total_rows,
+       COUNT(DISTINCT udm_unq_id) AS distinct_udm_unq_id,
+       COUNT(*) - COUNT(DISTINCT udm_unq_id) AS duplicate_pk
+FROM rgd_gold_ad.radiology;
+
+===========CORR-013: duplicate record check (img_date cast via LEFT, exclude null eid/date)=======
+SELECT COUNT(*) AS duplicate_groups, SUM(cnt - 1) AS excess_rows
 FROM (
-    SELECT psid, ndid, encounterid, resultid,
-           img_finding, result_date, img_date,
-           LOWER(study_name) AS study_name,
-           COUNT(*) AS grp_size
+    SELECT ndid, encounterid, LEFT(img_date,10) AS img_d, study_name,
+           img_modality, img_body_part, cpt_code, COUNT(*) AS cnt
     FROM rgd_gold_ad.radiology
     WHERE udm_active_flag = 'Y'
-    AND NOT (resultid IS NULL AND study_name IS NULL)
-    GROUP BY psid, ndid, encounterid, resultid,
-             img_finding, result_date, img_date,
-             LOWER(study_name)
+      AND encounterid IS NOT NULL
+      AND img_date IS NOT NULL AND TRIM(img_date) != ''
+    GROUP BY ndid, encounterid, LEFT(img_date,10), study_name,
+             img_modality, img_body_part, cpt_code
     HAVING COUNT(*) > 1
 ) t;
 
--- C4.2 Duplicate psid breakdown
-SELECT psid, COUNT(*) AS duplicate_groups, SUM(grp_size-1) AS excess_rows
-FROM (
-    SELECT psid, ndid, encounterid, resultid,
-           img_finding, result_date, img_date,
-           LOWER(study_name) AS study_name,
-           COUNT(*) AS grp_size
-    FROM rgd_gold_ad.radiology
-    WHERE udm_active_flag = 'Y'
-    AND NOT (resultid IS NULL AND study_name IS NULL)
-    GROUP BY psid, ndid, encounterid, resultid,
-             img_finding, result_date, img_date,
-             LOWER(study_name)
-    HAVING COUNT(*) > 1
-) t
-GROUP BY psid ORDER BY duplicate_groups DESC;
 
--- C4.3 Duplicate sample rows
-SELECT a.psid, a.ndid, a.encounterid, a.resultid,
-    a.img_finding, a.result_date, a.img_date, a.study_name
-FROM rgd_gold_ad.radiology a
-JOIN (
-    SELECT psid, ndid, encounterid, resultid,
-           img_finding, result_date, img_date,
-           LOWER(study_name) AS study_name_lower
-    FROM rgd_gold_ad.radiology
-    WHERE udm_active_flag = 'Y'
-    AND NOT (resultid IS NULL AND study_name IS NULL)
-    GROUP BY psid, ndid, encounterid, resultid,
-             img_finding, result_date, img_date,
-             LOWER(study_name)
-    HAVING COUNT(*) > 1
-    LIMIT 3
-) b ON a.psid <=> b.psid AND a.ndid <=> b.ndid
-    AND a.encounterid <=> b.encounterid
-    AND a.resultid <=> b.resultid
-    AND a.img_finding <=> b.img_finding
-    AND a.result_date <=> b.result_date
-    AND a.img_date <=> b.img_date
-    AND LOWER(a.study_name) <=> b.study_name_lower
-WHERE a.udm_active_flag = 'Y'
-ORDER BY a.psid, a.ndid, a.study_name;
+-- #############################################################################
+-- # 3. CONCORDANCE
+-- #############################################################################
 
--- C4.4 Orphan ndids
+===========CONC-001: referential integrity - orphan ndids (Critical, threshold 0%)=======
 SELECT COUNT(DISTINCT r.ndid) AS orphan_ndids
 FROM rgd_gold_ad.radiology r
 LEFT JOIN rgd_gold_ad.patients p ON r.ndid = p.ndid
 WHERE p.ndid IS NULL;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 5. CURRENCY
--- ─────────────────────────────────────────────────────────────────────────────
-
--- C5.1 udm_active_flag distribution
-SELECT udm_active_flag, COUNT(*) AS cnt
+===========CONC-005: cpt_code_source standard-value distribution=======
+-- VERIFIED: NULL 54.70% / probable_cpt 34.39% / proc_code 10.91%. Where coded, the code
+-- is mostly 'probable' (inferred, not source-verified) - flag for downstream use.
+SELECT COALESCE(cpt_code_source, 'NULL') AS cpt_code_source, COUNT(*) AS cnt,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
 FROM rgd_gold_ad.radiology
-GROUP BY udm_active_flag;
+GROUP BY cpt_code_source
+ORDER BY cnt DESC;
 
--- C5.2 Date range confirmation (VARCHAR cast required)
+===========CONC-005b: img_modality distribution (standardization + retired composite labels)=======
+-- VERIFIED: MR 32.68% + CT 16.77% dominate (appropriate for AD/neuro brain imaging).
+-- Note messy 'retired' composite labels (e.g. 'MA - Retired', 'EC - Retired') needing
+-- standardization. img_modality 32.87% null.
+SELECT COALESCE(img_modality, 'NULL') AS img_modality, COUNT(*) AS cnt,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+FROM rgd_gold_ad.radiology
+GROUP BY img_modality
+ORDER BY cnt DESC
+LIMIT 25;
+
+===========CONC-011: img_body_part distribution=======
+SELECT COALESCE(img_body_part, 'NULL') AS img_body_part, COUNT(*) AS cnt,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+FROM rgd_gold_ad.radiology
+GROUP BY img_body_part
+ORDER BY cnt DESC
+LIMIT 20;
+
+
+-- #############################################################################
+-- # 4. CREDIBILITY
+-- #############################################################################
+
+===========PLAUS-MODALITY: modality clinical plausibility (brain imaging dominance)=======
+SELECT COALESCE(img_modality, 'NULL') AS img_modality, COUNT(*) AS cnt,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+FROM rgd_gold_ad.radiology
+GROUP BY img_modality
+ORDER BY cnt DESC
+LIMIT 15;
+
+===========PLAUS-FREQ: records per patient=======
 SELECT
-    MIN(STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d')) AS min_img_date,
-    MAX(STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d')) AS max_img_date,
-    MIN(enc_date) AS min_enc_date,
-    MAX(enc_date) AS max_enc_date
+    MIN(rad_count) AS min_per_patient,
+    MAX(rad_count) AS max_per_patient,
+    ROUND(AVG(rad_count), 1) AS avg_per_patient,
+    SUM(CASE WHEN rad_count = 1 THEN 1 ELSE 0 END) AS patients_with_1,
+    SUM(CASE WHEN rad_count > 50 THEN 1 ELSE 0 END) AS patients_over_50
+FROM (
+    SELECT ndid, COUNT(*) AS rad_count
+    FROM rgd_gold_ad.radiology
+    GROUP BY ndid
+) t;
+
+===========PLAUS-STUDY: top study_name values=======
+SELECT study_name, COUNT(*) AS cnt
 FROM rgd_gold_ad.radiology
-WHERE img_date IS NOT NULL AND img_date != ''
-AND STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') BETWEEN '1900-01-01' AND '2900-01-01';
+WHERE study_name IS NOT NULL AND TRIM(study_name) != ''
+GROUP BY study_name
+ORDER BY cnt DESC
+LIMIT 20;
+
+
+-- #############################################################################
+-- # 5. CURRENCY
+-- #############################################################################
+
+===========CURR-013: historical data stability (udm_active_flag)=======
+SELECT COALESCE(udm_active_flag, 'NULL') AS udm_active_flag, COUNT(*) AS cnt,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_of_total
+FROM rgd_gold_ad.radiology
+GROUP BY udm_active_flag
+ORDER BY cnt DESC;
+
+===========CURR-014: future-dated events (Critical, threshold 0)=======
+SELECT
+    SUM(CASE WHEN STR_TO_DATE(LEFT(img_date,10),'%Y-%m-%d') > CURDATE() THEN 1 ELSE 0 END) AS future_img_date,
+    SUM(CASE WHEN enc_date > NOW() THEN 1 ELSE 0 END) AS future_enc_date
+FROM rgd_gold_ad.radiology;
+
+===========CURRENCY: run summary and load lineage=======
+SELECT run_id, cohort_run_id,
+       COUNT(*) AS total_records,
+       COUNT(DISTINCT ndid) AS unique_patients,
+       COUNT(DISTINCT source_udm_inc_id) AS distinct_source_records,
+       MIN(gold_created_datetime) AS gold_created_min,
+       MAX(gold_created_datetime) AS gold_created_max,
+       SUM(CASE WHEN gold_updated_datetime IS NULL THEN 1 ELSE 0 END) AS never_updated
+FROM rgd_gold_ad.radiology
+GROUP BY run_id, cohort_run_id
+ORDER BY cohort_run_id DESC;
+
+-- =============================================================================
+-- END OF FILE
+-- =============================================================================
